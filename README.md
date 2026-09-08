@@ -121,11 +121,10 @@ chmod +x diag.sh
 
 ## Changelog
 
-### 2.3.0 — Color-coded battery bar, false-notification fix, bereto.dev link
+### 2.3.0 — Color-coded battery bar, false-notification fix
 - Progress bar now changes color by charge level: green (>50%), orange (21–50%), red (≤20%)
 - Fixed false "No input power" notifications: MQTT merge now zeroes only the key-family present in the packet, so a solar-only update no longer clears AC input watts on DELTA 2
 - Notification debounce refactored from a wall-clock timer to a consecutive-reading streak (2 readings required), which is faster to confirm real outages and more resilient to transient blips
-- About page link updated to bereto.dev
 
 ### 2.2.1 — MQTT silence, setup validation, honest stale data
 - MQTT watchdog actually fires after the first live message: 30s without PUBLISH falls back to REST; 90s without any inbound packet reconnects
