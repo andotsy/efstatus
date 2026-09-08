@@ -1,6 +1,6 @@
 # EFStatus (v2.3.0)
 
-A lightweight macOS menu bar app that shows real-time EcoFlow Delta 2 battery status — no phone app needed, no Node.js, no cloud subscriptions. Ships as a universal binary for Intel and Apple Silicon.
+A lightweight macOS menu bar app that shows real-time EcoFlow Delta 2 battery status — no phone app needed, no Node.js, no cloud subscriptions. Ships as a universal binary for Intel and Apple Silicon (macOS 13+).
 
 ![EFStatus menu bar icon and popup showing battery percent, watts in and out, and time remaining](cover.jpg)
 

@@ -1,9 +1,10 @@
 # Version is defined in Resources/Info.plist (CFBundleShortVersionString 2.3.0 / CFBundleVersion 5).
+# MIN_OS 13.0: required for universal build on macOS 27 toolchain (x86_64 Swift compat56 shim dropped below 13.0).
 APP     = EFStatus
 BUNDLE  = $(APP).app
 EXEC    = $(BUNDLE)/Contents/MacOS/$(APP)
 SOURCES = $(wildcard Sources/*.swift)
-MIN_OS  = 12.0
+MIN_OS  = 13.0
 SWIFTC_FLAGS = -framework Cocoa -framework UserNotifications -framework CryptoKit -framework Network
 
 .PHONY: all clean run
@@ -14,12 +15,17 @@ $(BUNDLE): $(SOURCES) Resources/Info.plist Resources/AppIcon.icns
 	@mkdir -p $(BUNDLE)/Contents/MacOS
 	@mkdir -p $(BUNDLE)/Contents/Resources
 	swiftc $(SOURCES) $(SWIFTC_FLAGS) \
+		-target x86_64-apple-macosx$(MIN_OS) \
+		-o $(EXEC)-x86_64
+	swiftc $(SOURCES) $(SWIFTC_FLAGS) \
 		-target arm64-apple-macosx$(MIN_OS) \
-		-o $(EXEC)
+		-o $(EXEC)-arm64
+	lipo -create -output $(EXEC) $(EXEC)-x86_64 $(EXEC)-arm64
+	@rm -f $(EXEC)-x86_64 $(EXEC)-arm64
 	@cp Resources/Info.plist $(BUNDLE)/Contents/Info.plist
 	@cp Resources/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
 	codesign --force --deep --sign - --identifier com.efstatus.app $(BUNDLE)
-	@echo "✓ Built $(BUNDLE) (arm64)"
+	@echo "✓ Built universal $(BUNDLE) (x86_64 + arm64)"
 
 run: all
 	open $(BUNDLE)
