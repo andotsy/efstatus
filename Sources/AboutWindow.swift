@@ -40,7 +40,7 @@ class AboutWindow: NSWindow {
         let supportHeader = sectionHeader("Support")
         let updatesBtn = linkButton(title: "🔄  Check for Updates", url: "https://bereto.gumroad.com/l/efstatus")
         let coffeeBtn = linkButton(title: "☕  Buy Me a Coffee", url: "https://buymeacoffee.com/bereto")
-        let devBtn    = linkButton(title: "🌐  devteam.partners", url: "https://devteam.partners/about-us")
+        let devBtn    = linkButton(title: "🌐  bereto.dev", url: "https://bereto.dev")
 
         let stack = NSStackView(views: [
             appName, appSub,

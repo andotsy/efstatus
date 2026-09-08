@@ -19,7 +19,7 @@ class StatusBarController: NSObject {
     private var lastMQTTPacketAt:  Date?
     private var connectGen    = 0
 
-    private var inputLostTimer:     Timer?
+    private var zeroInputStreak     = 0      // consecutive readings (MQTT or REST) with inW == 0
     private var inputConfirmedLost = false
     private var prevWasOffline     = false
     private var outsideClickMonitor: Any?
@@ -57,8 +57,7 @@ class StatusBarController: NSObject {
         mqttLive = false
         lastMQTTMessageAt = nil
         lastMQTTPacketAt = nil
-        inputLostTimer?.invalidate()
-        inputLostTimer = nil
+        zeroInputStreak = 0
         inputConfirmedLost = false
         prevWasOffline = false
 
@@ -278,20 +277,22 @@ class StatusBarController: NSObject {
     private func updateUI(from state: [String: Any]) {
         let st = EcoFlowAPI.parseStatus(from: state)
 
+        // Debounce by consecutive readings instead of a wall-clock timer: MQTT pushes a
+        // message on nearly every state change (often sub-second while the device is
+        // active), so requiring 2 consecutive zero-input readings confirms a real outage
+        // much faster than a fixed delay, while still filtering out a single transient
+        // blip. Naturally falls back to REST poll cadence (~10s apart) when MQTT is down,
+        // since updateUI is fed by whichever source is currently live.
         if st.inW == 0 {
-            if !inputConfirmedLost && inputLostTimer == nil {
-                inputLostTimer = Timer.scheduledTimer(withTimeInterval: 7, repeats: false) { [weak self] _ in
-                    guard let self else { return }
-                    self.inputLostTimer = nil
-                    self.inputConfirmedLost = true
-                    guard UserDefaults.standard.bool(forKey: "notifyInputLost") else { return }
-                    let cur = EcoFlowAPI.parseStatus(from: self.deviceState)
-                    Notifier.send(title: "EFStatus", body: "No input power — drawing \(Int(cur.outW)) W from battery")
+            zeroInputStreak += 1
+            if !inputConfirmedLost && zeroInputStreak >= 2 {
+                inputConfirmedLost = true
+                if UserDefaults.standard.bool(forKey: "notifyInputLost") {
+                    Notifier.send(title: "EFStatus", body: "No input power — drawing \(Int(st.outW)) W from battery")
                 }
             }
         } else {
-            inputLostTimer?.invalidate()
-            inputLostTimer = nil
+            zeroInputStreak = 0
             if inputConfirmedLost {
                 inputConfirmedLost = false
                 if UserDefaults.standard.bool(forKey: "notifyInputRestored") {

@@ -119,24 +119,32 @@ class EcoFlowAPI {
 
     // MARK: – Status parsing (static — used by both REST and MQTT)
 
-    static let inputWattKeys: Set<String> = [
-        "mppt.inWatts", "inv.inputWatts", "bmsMaster.inputWatts", "powInSumW",
-        "wattsInSum", "inputWatts", "inputPower", "pd.wattsInSum",
+    // Input/output watt keys grouped by independent physical source.
+    // Zeroing is done per-family: a solar packet must not zero AC keys and vice versa.
+    // DELTA 2 has two separate input sources (mppt = solar, inv = AC); treating them
+    // as one group was the root cause of false "no input power" notifications.
+    private static let inputWattFamilies: [Set<String>] = [
+        ["mppt.inWatts"],                                                              // DELTA 2 solar
+        ["inv.inputWatts"],                                                            // DELTA 2 AC
+        ["bmsMaster.inputWatts", "powInSumW", "wattsInSum",
+         "inputWatts", "inputPower", "pd.wattsInSum"],                                 // DELTA 3 / others
     ]
-    static let outputWattKeys: Set<String> = [
-        "pd.wattsOutSum", "inv.outputWatts", "pd.wattsOut", "bmsMaster.outputWatts",
-        "powOutSumW", "wattsOutSum", "outputWatts", "outputPower",
+    private static let outputWattFamilies: [Set<String>] = [
+        ["pd.wattsOutSum", "pd.wattsOut"],                                             // DELTA 2
+        ["inv.outputWatts"],                                                           // DELTA 2 inverter
+        ["bmsMaster.outputWatts", "powOutSumW", "wattsOutSum", "outputWatts", "outputPower"], // DELTA 3 / others
     ]
 
-    /// Incremental MQTT merge. If a packet includes any input (or output) watt field,
-    /// omitted sibling watt fields are treated as 0 so leftover charger watts cannot stick.
+    /// Incremental MQTT merge. Zeros only the key-families represented in the incoming
+    /// packet so stale values from the same source cannot stick, without wiping
+    /// independent sources (e.g. AC and solar on DELTA 2).
     static func mergeMQTT(_ numeric: [String: Any], into state: inout [String: Any]) {
         let keys = Set(numeric.keys)
-        if !keys.isDisjoint(with: inputWattKeys) {
-            for k in inputWattKeys { state[k] = NSNumber(value: 0) }
+        for family in inputWattFamilies  where !keys.isDisjoint(with: family) {
+            for k in family { state[k] = NSNumber(value: 0) }
         }
-        if !keys.isDisjoint(with: outputWattKeys) {
-            for k in outputWattKeys { state[k] = NSNumber(value: 0) }
+        for family in outputWattFamilies where !keys.isDisjoint(with: family) {
+            for k in family { state[k] = NSNumber(value: 0) }
         }
         for (k, v) in numeric { state[k] = v }
     }

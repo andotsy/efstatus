@@ -201,7 +201,13 @@ class ProgressBar: NSView {
         let w = bounds.width * CGFloat(min(max(progress, 0), 1))
         if w > 0 {
             let fill = NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: w, height: bounds.height), xRadius: 3, yRadius: 3)
-            NSColor(red: 0.25, green: 0.85, blue: 0.45, alpha: 1).setFill()
+            let color: NSColor
+            switch progress {
+            case 0.51...: color = NSColor(red: 0.196, green: 1.000, blue: 0.431, alpha: 1) // > 50% green
+            case 0.21...: color = NSColor(red: 1.000, green: 0.608, blue: 0.000, alpha: 1) // 21–50% orange
+            default:      color = NSColor(red: 1.000, green: 0.176, blue: 0.176, alpha: 1) // ≤ 20% red
+            }
+            color.setFill()
             fill.fill()
         }
     }
