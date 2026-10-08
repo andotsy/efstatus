@@ -1,4 +1,4 @@
-# EFStatus (v2.3.0)
+# EFStatus (v2.4.0)
 
 A lightweight macOS menu bar app that shows real-time EcoFlow Delta 2 battery status — no phone app needed, no Node.js, no cloud subscriptions. Ships as a universal binary for Intel and Apple Silicon (macOS 13+).
 
@@ -49,7 +49,7 @@ On first launch (and whenever you change keys in Settings), **Save & Connect** c
 
 ## Requirements
 
-- macOS 12 or later
+- macOS 13 or later
 - Intel or Apple Silicon Mac
 - An [EcoFlow developer account](https://developer.ecoflow.com) with an API key
 - Xcode Command Line Tools (`xcode-select --install`) to build from source
@@ -74,7 +74,7 @@ open EFStatus.app
 
 Build on a Mac (`swiftc` + `lipo`). Linux cannot produce a real `EFStatus.app`.
 
-The first launch opens a setup window where you enter your EcoFlow API credentials. They're saved in `UserDefaults` on your Mac — never sent anywhere other than the EcoFlow API. Access Key, Secret Key, and device SN are shown in plain text in Setup, Settings, About, and Copy Diagnostics on purpose.
+The first launch opens a setup window where you enter your EcoFlow API credentials. They're stored in your macOS Keychain and never sent anywhere other than the EcoFlow API. Versions before 2.4.0 kept them in `UserDefaults`; 2.4.0 moves them to the Keychain automatically on first launch. After installing a new version, macOS may ask once whether EFStatus can read its Keychain item; choose **Always Allow**.
 
 ## First launch security
 
@@ -95,11 +95,13 @@ Save verifies the keys and SN against EcoFlow before dismissing the window.
 ## Notifications
 
 EFStatus sends a macOS notification when:
-- Input power drops to 0 W (running on battery only)
+- Input power drops to 0 W (confirmed: at least 10 seconds at 0 W, then double-checked against EcoFlow before alerting)
 - Input power is restored after a confirmed outage
-- The device goes offline or comes back online
+- The battery drops to 20% and 10% while discharging
+- The battery reaches 100%
+- The connection to your EcoFlow is lost (3 failed checks in a row) or comes back
 
-Those first two can be toggled in Settings. If you turn them on but macOS has denied notification permission (or a send fails), EFStatus tells you instead of failing silently.
+Each power and battery alert can be toggled in Settings. Newer alerts replace older ones of the same kind instead of piling up in Notification Center. If you turn them on but macOS has denied notification permission (or a send fails), EFStatus tells you instead of failing silently.
 
 ## Origin
 
@@ -120,6 +122,19 @@ chmod +x diag.sh
 ```
 
 ## Changelog
+
+### 2.4.0 — Real-time MQTT, smarter alerts, Keychain
+- **Real-time data now actually works:** the app was subscribed to an MQTT topic EcoFlow never publishes to, so it silently fell back to polling every 10 seconds. It now uses the correct feed and updates every couple of seconds
+- Fixed REST requests being rejected ("signature is wrong"): EcoFlow now requires the query parameters in the request signature
+- Far fewer API calls: no polling while MQTT is live, polling every 60s when the device is idle, and lightweight queries (~300 bytes instead of ~6.6 KB)
+- "No input power" is double-checked against EcoFlow after 10 seconds at 0 W, and only fires if input was seen before
+- New alerts: battery low (20% and 10%) and fully charged, each with its own toggle in Settings
+- No more false "Lost connection" alerts after the Mac wakes up: EFStatus pauses on sleep and reconnects cleanly on wake; it only alerts after 3 failed checks in a row
+- Notifications now show even with the popup open, and replace each other by type instead of stacking up
+- Time remaining / time to full is smoothed so it no longer jumps with every watt
+- API credentials moved from a plain-text preferences file to the macOS Keychain (migrated automatically)
+- Lower CPU and energy use: the menu bar icon is drawn once, the popup only redraws while open, and all timers let macOS batch wakeups
+- Minimum macOS is now 13 (matches the universal build)
 
 ### 2.3.0 — Color-coded battery bar, false-notification fix
 - Progress bar now changes color by charge level: green (>50%), orange (21–50%), red (≤20%)

@@ -1,211 +1,143 @@
 import Cocoa
 
-class StatusBarController: NSObject {
+final class StatusBarController: NSObject {
     private var statusItem: NSStatusItem!
     private var popup:    PopupPanel?
     private var setupWin: SetupWindow?
     private var aboutWin: AboutWindow?
 
-    private var api:          EcoFlowAPI?
-    private var mqttClient:   MQTTClient?
-    private var deviceState:  [String: Any] = [:]   // merged state: REST fills it, MQTT updates it
-
-    private var pollTimer:    Timer?   // REST fallback when MQTT is down or quiet
-    private var reconnTimer:  Timer?   // MQTT reconnect backoff
-    private var reconnDelay:  TimeInterval = 5
-    private var mqttWanted    = false  // false while swapping credentials / tearing down
-    private var mqttLive      = false  // true while MQTT is delivering data
+    // Connection
+    private var creds:       Credentials?
+    private var api:         EcoFlowAPI?
+    private var mqttClient:  MQTTClient?
+    private var deviceState: [String: Any] = [:]   // REST seeds it, MQTT updates it
+    private var pollKeys:    [String] = []         // relevant keys this device reports
+    private var lastStatus:  EFStatus?
+    private var connectGen   = 0
+    private var mqttWanted   = false
+    private var mqttLive     = false               // MQTT is delivering device data
     private var lastMQTTMessageAt: Date?
-    private var lastMQTTPacketAt:  Date?
-    private var connectGen    = 0
+    private var lastMQTTPacketAt:  Date?           // any inbound packet, incl. PINGRESP
+    private var restInFlight = false
+    private var restFailures = 0
+    private var isOffline    = false
+    private var notifiedOffline = false
+    private var isAsleep     = false
+    private var quietUntil   = Date.distantPast    // no connection alerts during startup / wake
 
-    private var zeroInputStreak     = 0      // consecutive readings (MQTT or REST) with inW == 0
+    // Timers
+    private var pollTimer:     Timer?
+    private var pollInterval:  TimeInterval = 0
+    private var watchdogTimer: Timer?
+    private var reconnTimer:   Timer?
+    private var reconnDelay:   TimeInterval = 5
+
+    // Notification state
+    private var sawInput           = false
+    private var zeroInputSince:    Date?
     private var inputConfirmedLost = false
-    private var prevWasOffline     = false
+    private var verifyingInput     = false
+    private var lastSoc:           Int?
+    private var lowNotified:       Set<Int> = []
+    private var fullNotified       = false
+    private var smoothedNet:       Double?
+    private var smoothedAt:        Date?
+
+    private var lastTitle = ""
     private var outsideClickMonitor: Any?
     private var localClickMonitor:   Any?
 
+    private enum Tuning {
+        static let pollWhenMQTTDown:   TimeInterval = 10
+        static let pollWhenMQTTQuiet:  TimeInterval = 60
+        static let watchdogInterval:   TimeInterval = 10
+        static let mqttQuietAfter:     TimeInterval = 30
+        static let mqttDeadAfter:      TimeInterval = 90
+        static let inputLostAfter:     TimeInterval = 10
+        static let failuresForOffline  = 3
+        static let connectionGrace:    TimeInterval = 30
+        static let lowBatteryLevels    = [20, 10]
+    }
+
     override init() {
         super.init()
-        UserDefaults.standard.register(defaults: [
-            "notifyInputLost":     true,
-            "notifyInputRestored": true,
-        ])
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.action = #selector(togglePopup)
             btn.target = self
             btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            btn.image = Self.makeStatusImage()
+            btn.imagePosition = .imageLeft
         }
         setStatusTitle("—")
 
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.closePopup()
-        }
+        NotificationCenter.default.addObserver(self, selector: #selector(closePopup),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(didWake),   name: NSWorkspace.didWakeNotification,   object: nil)
 
-        if let creds = CredentialsManager.load() { connect(creds) } else { showSetup() }
+        if let c = CredentialsManager.load() { connect(c) } else { showSetup() }
     }
 
-    // MARK: – Connection entry point
+    // MARK: – Connection lifecycle
 
-    private func connect(_ creds: Credentials) {
-        connectGen += 1
-        let gen = connectGen
-        api = EcoFlowAPI(accessKey: creds.accessKey, secretKey: creds.secretKey, serial: creds.serial)
+    private func connect(_ c: Credentials) {
+        teardown()
+        creds = c
+        api = EcoFlowAPI(accessKey: c.accessKey, secretKey: c.secretKey, serial: c.serial)
         deviceState.removeAll()
+        pollKeys = []
         mqttWanted = true
-        mqttLive = false
-        lastMQTTMessageAt = nil
-        lastMQTTPacketAt = nil
-        zeroInputStreak = 0
+        reconnDelay = 5
+        restFailures = 0
+        quietUntil = Date().addingTimeInterval(Tuning.connectionGrace)
+        resetTracking()
+
+        restPoll(full: true)
+        startWatchdog()
+        startMQTTSession()
+    }
+
+    private func teardown() {
+        connectGen += 1
+        mqttWanted = false
+        stopMQTTClient()
+        setPollInterval(0)
+        watchdogTimer?.invalidate(); watchdogTimer = nil
+        reconnTimer?.invalidate();   reconnTimer = nil
+        restInFlight = false
+    }
+
+    private func resetTracking() {
+        sawInput = false
+        zeroInputSince = nil
         inputConfirmedLost = false
-        prevWasOffline = false
+        verifyingInput = false
+        lastSoc = nil
+        lowNotified = []
+        fullNotified = false
+        smoothedNet = nil
+        smoothedAt = nil
+    }
 
-        // 1. REST fetch — immediate display while MQTT connects
-        restPoll()
+    @objc private func willSleep() {
+        isAsleep = true
+        teardown()
+    }
 
-        // 2. Get MQTT credentials and connect
-        Task {
-            do {
-                let mc = try await api!.fetchMQTTCredentials()
-                await MainActor.run {
-                    guard self.connectGen == gen, self.mqttWanted else { return }
-                    self.startMQTT(mc)
-                }
-            } catch {
-                await MainActor.run {
-                    guard self.connectGen == gen, self.mqttWanted else { return }
-                    self.startRestFallback()
-                    self.scheduleReconnect()
-                }
-            }
+    @objc private func didWake() {
+        isAsleep = false
+        // Give Wi-Fi a moment to come back before reconnecting.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, !self.isAsleep, let c = self.creds else { return }
+            self.connect(c)
         }
     }
 
     // MARK: – MQTT
 
-    private func startMQTT(_ creds: MQTTCredentials) {
-        stopMQTTClient()
-
-        let client = MQTTClient()
-        mqttClient = client
-
-        client.onConnect = { [weak self] in
-            guard let self, self.mqttWanted else { return }
-            self.mqttLive = false
-            self.lastMQTTPacketAt = Date()
-            self.reconnDelay = 5
-            client.subscribe(to: creds.topic)
-            self.startMQTTWatchdog()
-        }
-
-        client.onActivity = { [weak self] in
-            self?.lastMQTTPacketAt = Date()
-        }
-
-        client.onMessage = { [weak self] _, json in
-            self?.handleMQTTMessage(json)
-        }
-
-        client.onDisconnect = { [weak self] _ in
-            guard let self, self.mqttWanted else { return }
-            self.mqttLive = false
-            self.stopWatchdog()
-            self.startRestFallback()
-            self.scheduleReconnect()
-        }
-
-        client.connect(host: creds.url, port: creds.port,
-                       username: creds.username, password: creds.password,
-                       clientId: creds.clientId)
-    }
-
-    private func stopMQTTClient() {
-        mqttClient?.onDisconnect = nil
-        mqttClient?.onMessage = nil
-        mqttClient?.onConnect = nil
-        mqttClient?.onActivity = nil
-        mqttClient?.disconnect()
-        mqttClient = nil
-    }
-
-    private func handleMQTTMessage(_ json: [String: Any]) {
-        // EcoFlow sends params at the top level or nested under "params"
-        let params = json["params"] as? [String: Any] ?? json
-
-        // Filter: only accept numeric leaf values (same as REST quota structure)
-        let numeric = params.filter { $0.value is NSNumber }
-        guard !numeric.isEmpty else { return }
-
-        EcoFlowAPI.mergeMQTT(numeric, into: &deviceState)
-
-        lastMQTTMessageAt = Date()
-        lastMQTTPacketAt = Date()
-        mqttLive = true
-        startMQTTWatchdog()
-        stopRestFallback()
-
-        if prevWasOffline {
-            Notifier.send(title: "EFStatus", body: "Device back online")
-            prevWasOffline = false
-        }
-
-        updateUI(from: deviceState)
-    }
-
-    // MARK: – MQTT watchdog (REST backup if MQTT is silent > 30s)
-
-    private var watchdogTimer: Timer?
-
-    private func startMQTTWatchdog() {
-        watchdogTimer?.invalidate()
-        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.mqttWatchdogFired()
-        }
-    }
-
-    private func mqttWatchdogFired() {
-        let now = Date()
-        let dataAge = lastMQTTMessageAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        let packetAge = lastMQTTPacketAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-
-        // No PUBLISH for 30s — resume REST so the menu bar cannot sit on stale MQTT data
-        if dataAge >= 30 {
-            mqttLive = false
-            startRestFallback()
-        }
-
-        // Half-open socket: keepalive is 60s, pings every 30s. No inbound packet for 90s → reconnect.
-        if packetAge >= 90 {
-            recoverQuietMQTT()
-        }
-    }
-
-    private func recoverQuietMQTT() {
-        stopWatchdog()
-        stopMQTTClient()
-        mqttLive = false
-        startRestFallback()
-        scheduleReconnect()
-    }
-
-    private func stopWatchdog() {
-        watchdogTimer?.invalidate()
-        watchdogTimer = nil
-    }
-
-    // MARK: – MQTT reconnect (refresh certification; exponential backoff, max 60s)
-
-    private func scheduleReconnect() {
-        guard mqttWanted else { return }
-        reconnTimer?.invalidate()
-        reconnTimer = Timer.scheduledTimer(withTimeInterval: reconnDelay, repeats: false) { [weak self] _ in
-            self?.reconnectMQTT()
-        }
-        reconnDelay = min(reconnDelay * 2, 60)
-    }
-
-    private func reconnectMQTT() {
+    private func startMQTTSession() {
         guard mqttWanted, let api else { return }
         stopMQTTClient()
         let gen = connectGen
@@ -219,97 +151,262 @@ class StatusBarController: NSObject {
             } catch {
                 await MainActor.run {
                     guard self.connectGen == gen, self.mqttWanted else { return }
-                    self.startRestFallback()
+                    self.updatePolling()
                     self.scheduleReconnect()
                 }
             }
         }
     }
 
-    // MARK: – REST fallback polling (10s when MQTT is down or quiet)
+    private func startMQTT(_ mc: MQTTCredentials) {
+        let client = MQTTClient()
+        mqttClient = client
 
-    private func startRestFallback() {
-        guard pollTimer == nil else { return }
-        restPoll()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            self?.restPoll()
+        client.onConnect = { [weak self, weak client] in
+            guard let self, self.mqttWanted else { return }
+            self.lastMQTTPacketAt = Date()
+            self.reconnDelay = 5
+            client?.subscribe(to: mc.topic)
+            self.updatePolling()
         }
+        client.onActivity = { [weak self] in
+            self?.lastMQTTPacketAt = Date()
+        }
+        client.onMessage = { [weak self] _, json in
+            self?.handleMQTTMessage(json)
+        }
+        client.onDisconnect = { [weak self] _ in
+            guard let self, self.mqttWanted else { return }
+            self.mqttClient = nil
+            self.mqttLive = false
+            self.lastMQTTPacketAt = nil
+            self.updatePolling()
+            self.scheduleReconnect()
+        }
+
+        client.connect(host: mc.url, port: mc.port,
+                       username: mc.username, password: mc.password, clientId: mc.clientId)
     }
 
-    private func stopRestFallback() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    private func stopMQTTClient() {
+        guard let c = mqttClient else { return }
+        c.onDisconnect = nil
+        c.onMessage = nil
+        c.onConnect = nil
+        c.onActivity = nil
+        c.disconnect()
+        mqttClient = nil
+        mqttLive = false
+        lastMQTTPacketAt = nil
     }
 
-    private func restPoll(force: Bool = false) {
-        guard let api else { return }
+    private func handleMQTTMessage(_ json: [String: Any]) {
+        guard let fields = EcoFlowAPI.normalizeMQTT(json) else { return }
+        for (k, v) in fields { deviceState[k] = v }
+        lastMQTTMessageAt = Date()
+        if !mqttLive {
+            mqttLive = true
+            updatePolling()
+        }
+        markOnline()
+        updateUI()
+    }
+
+    private func scheduleReconnect() {
+        guard mqttWanted else { return }
+        reconnTimer?.invalidate()
+        reconnTimer = makeTimer(reconnDelay, repeats: false) { [weak self] in self?.startMQTTSession() }
+        reconnDelay = min(reconnDelay * 2, 60)
+    }
+
+    // MARK: – Watchdog (one timer for the whole session)
+
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = makeTimer(Tuning.watchdogInterval, repeats: true) { [weak self] in self?.watchdogTick() }
+    }
+
+    private func watchdogTick() {
+        guard !isAsleep else { return }
+        let now = Date()
+        if mqttLive, let t = lastMQTTMessageAt, now.timeIntervalSince(t) >= Tuning.mqttQuietAfter {
+            mqttLive = false
+        }
+        // Half-open socket: pings go out every 30s, so 90s of silence means it's dead.
+        if mqttClient != nil, let p = lastMQTTPacketAt, now.timeIntervalSince(p) >= Tuning.mqttDeadAfter {
+            stopMQTTClient()
+            scheduleReconnect()
+        }
+        updatePolling()
+        evaluateInput()
+    }
+
+    // MARK: – REST polling (only when MQTT isn't delivering)
+
+    private func updatePolling() {
+        let want: TimeInterval
+        if mqttLive                      { want = 0 }
+        else if lastMQTTPacketAt != nil  { want = Tuning.pollWhenMQTTQuiet }   // connected, device idle
+        else                             { want = Tuning.pollWhenMQTTDown }
+        setPollInterval(want)
+    }
+
+    private func setPollInterval(_ want: TimeInterval) {
+        guard want != pollInterval else { return }
+        let wasPolling = pollInterval > 0
+        pollTimer?.invalidate(); pollTimer = nil
+        pollInterval = want
+        guard want > 0 else { return }
+        pollTimer = makeTimer(want, repeats: true) { [weak self] in self?.restPoll() }
+        if !wasPolling { restPoll() }
+    }
+
+    private func restPoll(full: Bool = false, completion: ((EFStatus?) -> Void)? = nil) {
+        guard let api, !isAsleep, !restInFlight else { completion?(nil); return }
+        restInFlight = true
         let gen = connectGen
+        let keys: [String]? = (full || pollKeys.isEmpty) ? nil : pollKeys
         Task {
             do {
-                let (quota, _) = try await api.fetchStatus()
+                let q: [String: Any]
+                if let keys { q = try await api.fetchQuota(keys: keys) } else { q = try await api.fetchAllQuota() }
                 await MainActor.run {
                     guard self.connectGen == gen else { return }
-                    if self.mqttLive && !force { return }
-                    self.deviceState = quota   // full replacement from REST
-                    self.updateUI(from: quota)
-                    if self.prevWasOffline {
-                        Notifier.send(title: "EFStatus", body: "Device back online")
+                    self.restInFlight = false
+                    if keys == nil {
+                        self.deviceState = q
+                        self.pollKeys = EcoFlowAPI.relevantKeys.filter { q[$0] != nil }
+                    } else if q.isEmpty {
+                        self.pollKeys = []   // selective query unsupported; fall back to full
+                    } else {
+                        for (k, v) in q { self.deviceState[k] = v }
                     }
-                    self.prevWasOffline = false
+                    self.restFailures = 0
+                    self.markOnline()
+                    completion?(self.updateUI())
                 }
             } catch {
                 await MainActor.run {
                     guard self.connectGen == gen else { return }
-                    if self.mqttLive && !force { return }
-                    if !self.prevWasOffline {
-                        Notifier.send(title: "EFStatus", body: "Lost connection to device")
-                    }
-                    self.prevWasOffline = true
-                    self.setStatusTitle("—")
-                    self.popup?.setOffline()
+                    self.restInFlight = false
+                    self.restFailures += 1
+                    if self.restFailures >= Tuning.failuresForOffline && !self.mqttLive { self.markOffline() }
+                    completion?(nil)
                 }
             }
         }
     }
 
-    // MARK: – UI update
+    // MARK: – Online / offline
 
-    private func updateUI(from state: [String: Any]) {
-        let st = EcoFlowAPI.parseStatus(from: state)
+    private func markOnline() {
+        guard isOffline else { return }
+        isOffline = false
+        if notifiedOffline {
+            notifiedOffline = false
+            Notifier.send(.connection, "Connection to your EcoFlow restored")
+        }
+    }
 
-        // Debounce by consecutive readings instead of a wall-clock timer: MQTT pushes a
-        // message on nearly every state change (often sub-second while the device is
-        // active), so requiring 2 consecutive zero-input readings confirms a real outage
-        // much faster than a fixed delay, while still filtering out a single transient
-        // blip. Naturally falls back to REST poll cadence (~10s apart) when MQTT is down,
-        // since updateUI is fed by whichever source is currently live.
-        if st.inW == 0 {
-            zeroInputStreak += 1
-            if !inputConfirmedLost && zeroInputStreak >= 2 {
-                inputConfirmedLost = true
-                if UserDefaults.standard.bool(forKey: "notifyInputLost") {
-                    Notifier.send(title: "EFStatus", body: "No input power — drawing \(Int(st.outW)) W from battery")
-                }
-            }
+    private func markOffline() {
+        guard !isOffline else { return }
+        isOffline = true
+        zeroInputSince = nil
+        setStatusTitle("—")
+        popup?.setOffline()
+        if Date() >= quietUntil {
+            notifiedOffline = true
+            Notifier.send(.connection, "Lost connection to your EcoFlow")
+        }
+    }
+
+    // MARK: – UI + notifications
+
+    @discardableResult
+    private func updateUI() -> EFStatus {
+        var st = EcoFlowAPI.parseStatus(from: deviceState)
+
+        // ~60s time-based average of net watts for time estimates (MQTT can deliver
+        // several readings a second); snap when the direction flips (plug/unplug).
+        let raw = st.inW - st.outW
+        let now = Date()
+        if let s = smoothedNet, let at = smoothedAt, (s > 0) == (raw > 0) {
+            let alpha = 1 - exp(-now.timeIntervalSince(at) / 60)
+            smoothedNet = s + alpha * (raw - s)
         } else {
-            zeroInputStreak = 0
+            smoothedNet = raw
+        }
+        smoothedAt = now
+        st.smoothedNetW = smoothedNet
+
+        lastStatus = st
+        evaluateInput(st)
+        evaluateBattery(st)
+        setStatusTitle(st.socLabel)
+        if popup?.isVisible == true { popup?.update(st) }
+        return st
+    }
+
+    // "No input power" needs: input seen earlier, ≥10s at 0 W, then a fresh full REST read
+    // that still says 0 W. Single MQTT packets can't trigger it.
+    private func evaluateInput(_ current: EFStatus? = nil) {
+        guard let st = current ?? lastStatus, !isOffline else { return }
+        if st.inW > 0 {
+            sawInput = true
+            zeroInputSince = nil
             if inputConfirmedLost {
                 inputConfirmedLost = false
-                if UserDefaults.standard.bool(forKey: "notifyInputRestored") {
-                    Notifier.send(title: "EFStatus", body: "Input power restored — \(Int(st.inW)) W")
+                if NotificationPref.inputRestored.isOn {
+                    Notifier.send(.input, "Input power restored — \(Int(st.inW)) W")
                 }
+            }
+            return
+        }
+        guard sawInput, !inputConfirmedLost, !verifyingInput else { return }
+        let since = zeroInputSince ?? Date()
+        zeroInputSince = since
+        guard Date().timeIntervalSince(since) >= Tuning.inputLostAfter else { return }
+
+        verifyingInput = true
+        restPoll(full: true) { [weak self] verified in
+            guard let self else { return }
+            self.verifyingInput = false
+            guard let v = verified, v.inW == 0, !self.inputConfirmedLost else { return }
+            self.inputConfirmedLost = true
+            if NotificationPref.inputLost.isOn {
+                Notifier.send(.input, "No input power — drawing \(Int(v.outW)) W from battery")
+            }
+        }
+    }
+
+    private func evaluateBattery(_ st: EFStatus) {
+        guard let soc = st.soc else { return }
+        defer { lastSoc = soc }
+        guard let prev = lastSoc else { return }
+
+        for level in Tuning.lowBatteryLevels {
+            if soc >= level + 5 { lowNotified.remove(level) }
+            guard soc <= level, prev > level, !lowNotified.contains(level), st.inW < st.outW else { continue }
+            lowNotified.insert(level)
+            if NotificationPref.lowBattery.isOn {
+                let left = st.timeToEmptyMin.map { " — about \(st.fmtTime($0)) left" } ?? ""
+                Notifier.send(.battery, "Battery low: \(soc)%\(left)")
             }
         }
 
-        setStatusTitle(st.socLabel)
-        popup?.update(st)
+        if soc <= 95 { fullNotified = false }
+        if soc >= 100, prev < 100, !fullNotified {
+            fullNotified = true
+            if NotificationPref.fullCharge.isOn { Notifier.send(.battery, "Fully charged — 100%") }
+        }
     }
-
-    // MARK: – Manual refresh (refresh button in popup)
 
     private func manualRefresh() {
         popup?.setRefreshing()
-        restPoll(force: true)   // force a REST fetch regardless of MQTT state
+        restPoll(full: true) { [weak self] st in
+            guard let self, st == nil else { return }
+            if let s = self.lastStatus, !self.isOffline { self.popup?.update(s) } else { self.popup?.setOffline() }
+        }
     }
 
     // MARK: – Popup
@@ -320,28 +417,26 @@ class StatusBarController: NSObject {
 
         if let p = popup, p.isVisible { closePopup(); return }
 
-        guard let btn = statusItem.button,
-              let screen = btn.window?.screen ?? NSScreen.main else { return }
+        guard let btn = statusItem.button, let btnWindow = btn.window,
+              let screen = btnWindow.screen ?? NSScreen.main else { return }
 
         if popup == nil {
             popup = PopupPanel()
             popup?.onRefresh = { [weak self] in self?.manualRefresh() }
-            if prevWasOffline {
-                popup?.setOffline()
-            } else if !deviceState.isEmpty {
-                popup?.update(EcoFlowAPI.parseStatus(from: deviceState))
-            }
+        }
+        if isOffline {
+            popup?.setOffline()
+        } else if let st = lastStatus {
+            popup?.update(st)
         }
 
-        let btnFrame = btn.window!.convertToScreen(btn.frame)
+        let btnFrame = btnWindow.convertToScreen(btn.frame)
         let panelW   = popup?.frame.width ?? 220
         var x = btnFrame.midX - panelW / 2
-        let y = btnFrame.minY + 2
-
         x = min(x, screen.visibleFrame.maxX - panelW - 4)
         x = max(x, screen.visibleFrame.minX + 4)
 
-        popup?.setFrameTopLeftPoint(NSPoint(x: x, y: y))
+        popup?.setFrameTopLeftPoint(NSPoint(x: x, y: btnFrame.minY + 2))
         popup?.orderFrontRegardless()
 
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -356,7 +451,7 @@ class StatusBarController: NSObject {
         }
     }
 
-    private func closePopup() {
+    @objc private func closePopup() {
         popup?.orderOut(nil)
         if let m = outsideClickMonitor { NSEvent.removeMonitor(m); outsideClickMonitor = nil }
         if let m = localClickMonitor   { NSEvent.removeMonitor(m); localClickMonitor   = nil }
@@ -364,31 +459,18 @@ class StatusBarController: NSObject {
 
     private func showContextMenu() {
         let menu = NSMenu()
-
-        let settings = NSMenuItem(title: "Settings…", action: #selector(showSetup), keyEquivalent: ",")
-        settings.target = self
-        menu.addItem(settings)
-
-        let updates = NSMenuItem(title: "Check for Updates…", action: #selector(openUpdates), keyEquivalent: "")
-        updates.target = self
-        menu.addItem(updates)
-
-        let diag = NSMenuItem(title: "Copy Diagnostics", action: #selector(copyDiagnostics), keyEquivalent: "")
-        diag.target = self
-        menu.addItem(diag)
-
-        let help = NSMenuItem(title: "Help & Support", action: #selector(openRepo), keyEquivalent: "")
-        help.target = self
-        menu.addItem(help)
-
-        let about = NSMenuItem(title: "About EFStatus", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit EFStatus",
-                                action: #selector(NSApplication.terminate(_:)),
-                                keyEquivalent: "q"))
+        func item(_ title: String, _ action: Selector, _ key: String = "") {
+            let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            i.target = self
+            menu.addItem(i)
+        }
+        item("Settings…", #selector(showSetup), ",")
+        item("Check for Updates…", #selector(openUpdates))
+        item("Copy Diagnostics", #selector(copyDiagnostics))
+        item("Help & Support", #selector(openRepo))
+        item("About EFStatus", #selector(showAbout))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit EFStatus", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
@@ -405,7 +487,7 @@ class StatusBarController: NSObject {
     }
 
     @objc private func copyDiagnostics() {
-        guard let api else { Notifier.send(title: "EFStatus", body: "No credentials configured."); return }
+        guard let api else { Notifier.send(.app, "No credentials configured."); return }
         Task {
             do {
                 let output = try await api.fetchRawFields()
@@ -413,9 +495,9 @@ class StatusBarController: NSObject {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(output, forType: .string)
                 }
-                Notifier.send(title: "EFStatus", body: "Diagnostics copied to clipboard.")
+                Notifier.send(.app, "Diagnostics copied to clipboard.")
             } catch {
-                Notifier.send(title: "EFStatus", body: "Failed to fetch diagnostics.")
+                Notifier.send(.app, "Failed to fetch diagnostics.")
             }
         }
     }
@@ -426,66 +508,49 @@ class StatusBarController: NSObject {
         aboutWin?.makeKeyAndOrderFront(nil)
     }
 
-    // MARK: – Status bar title helper
-
-    private func setStatusTitle(_ value: String) {
-        guard let btn = statusItem.button else { return }
-
-        // Build a template image: "EF" text + bolt symbol side by side
-        let font = NSFont.menuBarFont(ofSize: 12)
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.white
-        ]
-        let label = "EF" as NSString
-        let textSize = label.size(withAttributes: textAttrs)
-
-        let symCfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
-        let boltBase = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(symCfg)
-        let boltSize = boltBase?.size ?? NSSize(width: 8, height: 13)
-
-        let gap: CGFloat = 1
-        let imgW = textSize.width + gap + boltSize.width
-        let imgH: CGFloat = 16
-
-        let composite = NSImage(size: NSSize(width: imgW, height: imgH), flipped: false) { _ in
-            // Draw "EF" in white
-            label.draw(at: NSPoint(x: 0, y: (imgH - textSize.height) / 2),
-                       withAttributes: textAttrs)
-            // Draw bolt in white
-            if let bolt = boltBase {
-                NSColor.white.set()
-                bolt.draw(in: NSRect(x: textSize.width + gap,
-                                     y: (imgH - boltSize.height) / 2,
-                                     width: boltSize.width,
-                                     height: boltSize.height))
-            }
-            return true
-        }
-        composite.isTemplate = true
-
-        btn.image = composite
-        btn.imagePosition = .imageLeft
-        btn.title = value   // "89%" — uses button's default menu bar font
-    }
-
     @objc func showSetup() {
         if setupWin == nil {
             setupWin = SetupWindow()
-            setupWin?.onSave = { [weak self] creds in
-                guard let self else { return }
-                self.mqttWanted = false
-                self.connectGen += 1
-                self.stopMQTTClient()
-                self.stopRestFallback()
-                self.stopWatchdog()
-                self.reconnTimer?.invalidate()
-                self.reconnTimer = nil
-                self.connect(creds)
-            }
+            setupWin?.onSave = { [weak self] creds in self?.connect(creds) }
         }
         NSApp.activate(ignoringOtherApps: true)
         setupWin?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: – Helpers
+
+    private func setStatusTitle(_ value: String) {
+        guard value != lastTitle else { return }
+        lastTitle = value
+        statusItem.button?.title = value
+    }
+
+    private func makeTimer(_ interval: TimeInterval, repeats: Bool, _ block: @escaping () -> Void) -> Timer {
+        let t = Timer(timeInterval: interval, repeats: repeats) { _ in block() }
+        t.tolerance = interval * 0.2
+        RunLoop.main.add(t, forMode: .common)
+        return t
+    }
+
+    private static func makeStatusImage() -> NSImage {
+        let font = NSFont.menuBarFont(ofSize: 12)
+        let textAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let label = "EF" as NSString
+        let textSize = label.size(withAttributes: textAttrs)
+
+        let bolt = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        let boltSize = bolt?.size ?? NSSize(width: 8, height: 13)
+
+        let gap: CGFloat = 1
+        let imgH: CGFloat = 16
+        let image = NSImage(size: NSSize(width: textSize.width + gap + boltSize.width, height: imgH), flipped: false) { _ in
+            label.draw(at: NSPoint(x: 0, y: (imgH - textSize.height) / 2), withAttributes: textAttrs)
+            bolt?.draw(in: NSRect(x: textSize.width + gap, y: (imgH - boltSize.height) / 2,
+                                  width: boltSize.width, height: boltSize.height))
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 }

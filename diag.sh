@@ -19,7 +19,7 @@ done
 
 NONCE=$(( RANDOM * RANDOM ))
 TIMESTAMP=$(( $(date +%s) * 1000 ))
-RAW="accessKey=${ACCESS_KEY}&nonce=${NONCE}&timestamp=${TIMESTAMP}"
+RAW="sn=${SERIAL}&accessKey=${ACCESS_KEY}&nonce=${NONCE}&timestamp=${TIMESTAMP}"
 
 SIG=$(echo -n "$RAW" | openssl dgst -sha256 -hmac "$SECRET_KEY" | awk '{print $2}')
 
@@ -27,8 +27,7 @@ RESPONSE=$(curl -s "https://api.ecoflow.com/iot-open/sign/device/quota/all?sn=${
   -H "accessKey: ${ACCESS_KEY}" \
   -H "nonce: ${NONCE}" \
   -H "timestamp: ${TIMESTAMP}" \
-  -H "sign: ${SIG}" \
-  -H "Content-Type: application/json")
+  -H "sign: ${SIG}")
 
 echo ""
 echo "=== EFStatus Diagnostic Output ==="

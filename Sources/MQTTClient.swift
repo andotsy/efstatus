@@ -147,11 +147,18 @@ final class MQTTClient {
     /// Returns false when the connection was torn down for a malformed frame.
     @discardableResult
     private func processBufferLocked() -> Bool {
-        while buffer.count >= 2 {
+        // Parse every complete frame first, then drop the consumed bytes once.
+        var start = buffer.startIndex
+        defer {
+            // teardown may have emptied the buffer mid-loop
+            if start > buffer.startIndex && start <= buffer.endIndex { buffer.removeSubrange(buffer.startIndex..<start) }
+        }
+        while buffer.endIndex - start >= 2 {
+            let avail = buffer.endIndex - start
             var mul = 1, rem = 0, i = 1
             var lengthComplete = false
-            while i < min(5, buffer.count) {
-                let b = Int(buffer[i])
+            while i < min(5, avail) {
+                let b = Int(buffer[start + i])
                 rem += (b & 0x7F) * mul
                 mul *= 128
                 i += 1
@@ -175,11 +182,12 @@ final class MQTTClient {
 
             let hdrLen = i
             let total  = hdrLen + rem
-            guard buffer.count >= total else { return true }
+            guard avail >= total else { return true }
 
-            let pkt = Data(buffer.prefix(total))
-            buffer = Data(buffer.dropFirst(total))
+            let pkt = Data(buffer[start ..< start + total])
+            start += total
             dispatchLocked(pkt, hdrLen: hdrLen)
+            if connection == nil { return false }
         }
         return true
     }
@@ -232,14 +240,16 @@ final class MQTTClient {
     // MARK: – Keepalive
 
     private func startPingTimer() {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             self.pingTimer?.invalidate()
-            self.pingTimer = Timer.scheduledTimer(
-                withTimeInterval: Double(self.keepAlive) / 2,
-                repeats: true
-            ) { [weak self] _ in
-                self?.io.async { self?.sendLocked(Data([0xC0, 0x00])) }
+            let t = Timer(timeInterval: Double(self.keepAlive) / 2, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.io.async { self.sendLocked(Data([0xC0, 0x00])) }
             }
+            t.tolerance = 3
+            RunLoop.main.add(t, forMode: .common)
+            self.pingTimer = t
         }
     }
 

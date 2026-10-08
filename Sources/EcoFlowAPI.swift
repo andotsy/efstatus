@@ -8,19 +8,23 @@ struct EFStatus {
     let remainWh: Int?
     let capacityWh: Int?
     let deviceLabel: String
+    /// Smoothed (inW - outW) used for time estimates so they don't jump with every watt flicker.
+    var smoothedNetW: Double? = nil
 
     var socLabel: String { soc.map { "\($0)%" } ?? "—" }
     var socProgress: Double { soc.map { Double($0) / 100.0 } ?? 0 }
 
+    private var netW: Double { smoothedNetW ?? (inW - outW) }
+
     var timeToEmptyMin: Int? {
-        let net = outW - inW
-        guard let r = remainWh, net > 0 else { return nil }
+        let net = -netW
+        guard let r = remainWh, net > 1 else { return nil }
         return Int(Double(r) / net * 60)
     }
 
     var timeToFullMin: Int? {
-        let net = inW - outW
-        guard let r = remainWh, let c = capacityWh, net > 0 else { return nil }
+        let net = netW
+        guard let r = remainWh, let c = capacityWh, net > 1, c > r else { return nil }
         return Int(Double(c - r) / net * 60)
     }
 
@@ -47,10 +51,17 @@ struct MQTTCredentials {
     let topic:    String
 }
 
-class EcoFlowAPI {
+final class EcoFlowAPI {
     let accessKey: String
     let secretKey: String
     let serial:    String
+
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.urlCache = nil
+        cfg.timeoutIntervalForRequest = 10
+        return URLSession(configuration: cfg)
+    }()
 
     init(accessKey: String, secretKey: String, serial: String) {
         self.accessKey = accessKey
@@ -58,34 +69,50 @@ class EcoFlowAPI {
         self.serial    = serial
     }
 
-    // MARK: – REST: full quota fetch
+    // MARK: – REST
 
-    func fetchStatus() async throws -> (quota: [String: Any], status: EFStatus) {
-        let quota = try await fetchQuota()
-        return (quota, EcoFlowAPI.parseStatus(from: quota))
+    /// Every quota key parseStatus can read, across supported models.
+    static let relevantKeys: [String] = [
+        "pd.wattsInSum", "pd.wattsOutSum", "pd.wattsOut", "pd.soc",
+        "inv.inputWatts", "inv.outputWatts", "mppt.inWatts",
+        "bms_emsStatus.lcdShowSoc", "bms_bmsStatus.soc",
+        "bms_bmsStatus.remainCap", "bms_bmsStatus.designCap", "bms_bmsStatus.vol",
+        "bmsMaster.f32ShowSoc", "bmsMaster.soc", "bmsMaster.inputWatts", "bmsMaster.outputWatts",
+        "cmsBattSoc", "ems.soc", "soc", "powInSumW", "powOutSumW",
+        "wattsInSum", "wattsOutSum", "inputWatts", "outputWatts", "inputPower", "outputPower",
+    ]
+
+    /// Full quota (~260 fields). Used on connect, manual refresh and diagnostics.
+    func fetchAllQuota() async throws -> [String: Any] {
+        let json = try await ecoflowJSON(method: "GET", path: "/iot-open/sign/device/quota/all",
+                                         query: ["sn": serial])
+        return try quotaData(json)
+    }
+
+    /// Only the requested keys (~300 bytes instead of ~6.6 KB).
+    func fetchQuota(keys: [String]) async throws -> [String: Any] {
+        let body: [String: Any] = ["sn": serial, "params": ["quotas": keys]]
+        let json = try await ecoflowJSON(method: "POST", path: "/iot-open/sign/device/quota", body: body)
+        return try quotaData(json)
     }
 
     /// Live check used by Setup. Requires a non-empty quota so a wrong SN cannot pass.
     func verifyCredentials() async throws {
-        let quota = try await fetchQuota()
-        if quota.isEmpty {
+        if try await fetchAllQuota().isEmpty {
             throw ecoError(code: 1, message: "No data for this serial number. Check the device SN.")
         }
     }
 
-    private func fetchQuota() async throws -> [String: Any] {
-        let json = try await ecoflowJSON(path: "/iot-open/sign/device/quota/all?sn=\(serial)")
+    private func quotaData(_ json: [String: Any]) throws -> [String: Any] {
         try requireOK(json)
-        guard let q = json["data"] as? [String: Any] else {
-            throw ecoError(code: 1, message: "API error")
-        }
+        guard let q = json["data"] as? [String: Any] else { throw ecoError(code: 1, message: "API error") }
         return q
     }
 
     // MARK: – MQTT credentials
 
     func fetchMQTTCredentials() async throws -> MQTTCredentials {
-        let json = try await ecoflowJSON(path: "/iot-open/sign/certification")
+        let json = try await ecoflowJSON(method: "GET", path: "/iot-open/sign/certification")
         try requireOK(json)
         guard
             let d        = json["data"] as? [String: Any],
@@ -97,7 +124,7 @@ class EcoFlowAPI {
             throw ecoError(code: 2, message: "MQTT certification failed")
         }
         let clientId = "ANDROID_\(username)_\(Int.random(in: 100_000...999_999))"
-        let topic    = "/app/device/property/\(serial)"
+        let topic    = "/open/\(username)/\(serial)/quota"
         return MQTTCredentials(url: url, port: port, username: username,
                                password: password, clientId: clientId, topic: topic)
     }
@@ -105,7 +132,7 @@ class EcoFlowAPI {
     // MARK: – Diagnostics
 
     func fetchRawFields() async throws -> String {
-        let q = try await fetchQuota()
+        let q = try await fetchAllQuota()
         var lines = ["EFStatus Diagnostic — \(serial)", "Fields: \(q.count)", ""]
         for key in q.keys.sorted() {
             if let n = q[key] as? NSNumber { lines.append("\(key): \(n)") }
@@ -117,83 +144,64 @@ class EcoFlowAPI {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: – Status parsing (static — used by both REST and MQTT)
+    // MARK: – MQTT message normalization
 
-    // Input/output watt keys grouped by independent physical source.
-    // Zeroing is done per-family: a solar packet must not zero AC keys and vice versa.
-    // DELTA 2 has two separate input sources (mppt = solar, inv = AC); treating them
-    // as one group was the root cause of false "no input power" notifications.
-    private static let inputWattFamilies: [Set<String>] = [
-        ["mppt.inWatts"],                                                              // DELTA 2 solar
-        ["inv.inputWatts"],                                                            // DELTA 2 AC
-        ["bmsMaster.inputWatts", "powInSumW", "wattsInSum",
-         "inputWatts", "inputPower", "pd.wattsInSum"],                                 // DELTA 3 / others
-    ]
-    private static let outputWattFamilies: [Set<String>] = [
-        ["pd.wattsOutSum", "pd.wattsOut"],                                             // DELTA 2
-        ["inv.outputWatts"],                                                           // DELTA 2 inverter
-        ["bmsMaster.outputWatts", "powOutSumW", "wattsOutSum", "outputWatts", "outputPower"], // DELTA 3 / others
+    // The open MQTT feed sends module fields without the REST prefix and names the module
+    // in `typeCode`; map them back so MQTT and REST share one key space.
+    private static let typeCodePrefix: [String: String] = [
+        "pdStatus":   "pd.",
+        "invStatus":  "inv.",
+        "mpptStatus": "mppt.",
+        "bmsStatus":  "bms_bmsStatus.",
+        "emsStatus":  "bms_emsStatus.",
+        "bmsInfo":    "bms_bmsInfo.",
+        "kitInfo":    "bms_kitInfo.",
     ]
 
-    /// Incremental MQTT merge. Zeros only the key-families represented in the incoming
-    /// packet so stale values from the same source cannot stick, without wiping
-    /// independent sources (e.g. AC and solar on DELTA 2).
-    static func mergeMQTT(_ numeric: [String: Any], into state: inout [String: Any]) {
-        let keys = Set(numeric.keys)
-        for family in inputWattFamilies  where !keys.isDisjoint(with: family) {
-            for k in family { state[k] = NSNumber(value: 0) }
+    /// Numeric fields of an MQTT quota message, keyed like the REST quota. Nil for
+    /// command/ack messages that carry no device state.
+    static func normalizeMQTT(_ json: [String: Any]) -> [String: Any]? {
+        guard let params = (json["params"] ?? json["param"]) as? [String: Any] else { return nil }
+        let typeCode = json["typeCode"] as? String
+        if typeCode == nil && json["instructCode"] != nil { return nil }
+        let prefix = typeCode.flatMap { typeCodePrefix[$0] } ?? ""
+        var out: [String: Any] = [:]
+        for (k, v) in params where v is NSNumber {
+            out[k.contains(".") ? k : prefix + k] = v
         }
-        for family in outputWattFamilies where !keys.isDisjoint(with: family) {
-            for k in family { state[k] = NSNumber(value: 0) }
-        }
-        for (k, v) in numeric { state[k] = v }
+        return out.isEmpty ? nil : out
     }
+
+    // MARK: – Status parsing (shared by REST and MQTT)
 
     static func parseStatus(from q: [String: Any]) -> EFStatus {
         func d(_ k: String) -> Double { (q[k] as? NSNumber)?.doubleValue ?? 0 }
         func dOpt(_ keys: String...) -> Double? { keys.compactMap { (q[$0] as? NSNumber)?.doubleValue }.first }
 
-        // SOC — nil when no field is present so the UI can show "—" instead of a fake 0%
-        let soc: Int? = {
-            if let v = dOpt("bms_emsStatus.lcdShowSoc") { return Int(v) }
-            if let v = dOpt("bmsMaster.f32ShowSoc") { return Int(v) }
-            if let v = dOpt("bmsMaster.soc", "cmsBattSoc") { return Int(v) }
-            if let v = dOpt("ems.soc", "soc", "pd.soc") { return Int(v) }
-            if let v = dOpt("bms_bmsStatus.soc") { return Int(v) }
-            return nil
-        }()
+        let soc: Int? = dOpt("bms_emsStatus.lcdShowSoc", "bmsMaster.f32ShowSoc", "bmsMaster.soc",
+                             "cmsBattSoc", "pd.soc", "ems.soc", "soc", "bms_bmsStatus.soc").map { Int($0.rounded()) }
 
-        // Device generation
         let isDelta2 = q["mppt.inWatts"] != nil || q["inv.inputWatts"] != nil
         let isDelta3 = q["bmsMaster.inputWatts"] != nil || q["powInSumW"] != nil
 
-        // Input watts
-        let solar = d("mppt.inWatts")
         let inW: Double
-        if isDelta2 {
-            inW = solar + d("inv.inputWatts")
-        } else if isDelta3 {
-            inW = dOpt("bmsMaster.inputWatts", "powInSumW", "wattsInSum", "inputWatts", "inputPower") ?? 0
-        } else {
-            inW = dOpt("pd.wattsInSum") ?? 0
-        }
-
-        // Output watts
         let outW: Double
         if isDelta2 {
+            // pd.wattsInSum is the device's own total of every input (AC + solar + car).
+            inW  = dOpt("pd.wattsInSum") ?? (d("mppt.inWatts") + d("inv.inputWatts"))
             outW = dOpt("pd.wattsOutSum", "inv.outputWatts", "pd.wattsOut") ?? 0
         } else if isDelta3 {
+            inW  = dOpt("bmsMaster.inputWatts", "powInSumW", "wattsInSum", "inputWatts", "inputPower") ?? 0
             outW = dOpt("bmsMaster.outputWatts", "powOutSumW", "wattsOutSum", "outputWatts", "outputPower") ?? 0
         } else {
+            inW  = dOpt("pd.wattsInSum") ?? 0
             outW = dOpt("pd.wattsOutSum") ?? 0
         }
 
-        // Remaining / capacity Wh from BMS mAh × mV
-        let remainCap = dOpt("bms_bmsStatus.remainCap")
-        let designCap = dOpt("bms_bmsStatus.designCap")
-        let vol       = dOpt("bms_bmsStatus.vol")
-        let remainWh  = (remainCap != nil && vol != nil) ? Int(remainCap! * vol! / 1_000_000) : nil
-        let capWh     = (designCap != nil && vol != nil) ? Int(designCap!  * vol! / 1_000_000) : nil
+        // Wh from BMS mAh × mV
+        let vol      = dOpt("bms_bmsStatus.vol")
+        let remainWh = zip2(dOpt("bms_bmsStatus.remainCap"), vol).map { Int($0 * $1 / 1_000_000) }
+        let capWh    = zip2(dOpt("bms_bmsStatus.designCap"), vol).map { Int($0 * $1 / 1_000_000) }
 
         let deviceLabel = isDelta3 ? "DELTA 3" : isDelta2 ? "DELTA 2" : "ECOFLOW"
 
@@ -201,11 +209,17 @@ class EcoFlowAPI {
                         remainWh: remainWh, capacityWh: capWh, deviceLabel: deviceLabel)
     }
 
+    private static func zip2(_ a: Double?, _ b: Double?) -> (Double, Double)? {
+        guard let a, let b else { return nil }
+        return (a, b)
+    }
+
     // MARK: – Transport
 
-    private func ecoflowJSON(path: String) async throws -> [String: Any] {
-        let req = try signedRequest(path: path)
-        let (data, response) = try await URLSession.shared.data(for: req)
+    private func ecoflowJSON(method: String, path: String,
+                             query: [String: String] = [:], body: [String: Any]? = nil) async throws -> [String: Any] {
+        let req = try signedRequest(method: method, path: path, query: query, body: body)
+        let (data, response) = try await Self.session.data(for: req)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             let apiMsg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String
             throw ecoError(code: http.statusCode, message: apiMsg ?? "EcoFlow HTTP \(http.statusCode)")
@@ -243,18 +257,47 @@ class EcoFlowAPI {
 
     // MARK: – Signing
 
-    private func signedRequest(path: String) throws -> URLRequest {
-        guard let url = URL(string: "https://api.ecoflow.com\(path)") else { throw URLError(.badURL) }
+    // EcoFlow signs "k=v&…" of every query/body parameter (flattened, ASCII-sorted),
+    // followed by accessKey, nonce and timestamp. Requests that omit them are rejected.
+    private func signedRequest(method: String, path: String,
+                               query: [String: String], body: [String: Any]?) throws -> URLRequest {
+        var comps = URLComponents(string: "https://api.ecoflow.com\(path)")
+        if !query.isEmpty {
+            comps?.queryItems = query.keys.sorted().map { URLQueryItem(name: $0, value: query[$0]) }
+        }
+        guard let url = comps?.url else { throw URLError(.badURL) }
+
+        var pairs = query.map { ($0.key, $0.value) }
+        if let body { Self.flatten(body, prefix: "", into: &pairs) }
+        let params = pairs.sorted { $0.0 < $1.0 }.map { "\($0.0)=\($0.1)" }
+
         let nonce     = String(Int.random(in: 100_000...999_999))
         let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
-        let raw       = "accessKey=\(accessKey)&nonce=\(nonce)&timestamp=\(timestamp)"
+        let raw = (params + ["accessKey=\(accessKey)", "nonce=\(nonce)", "timestamp=\(timestamp)"])
+            .joined(separator: "&")
+
         var req = URLRequest(url: url, timeoutInterval: 10)
+        req.httpMethod = method
         req.setValue(accessKey, forHTTPHeaderField: "accessKey")
         req.setValue(nonce,     forHTTPHeaderField: "nonce")
         req.setValue(timestamp, forHTTPHeaderField: "timestamp")
         req.setValue(hmac(key: secretKey, data: raw), forHTTPHeaderField: "sign")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let body {
+            req.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
         return req
+    }
+
+    private static func flatten(_ value: Any, prefix: String, into out: inout [(String, String)]) {
+        switch value {
+        case let dict as [String: Any]:
+            for (k, v) in dict { flatten(v, prefix: prefix.isEmpty ? k : "\(prefix).\(k)", into: &out) }
+        case let arr as [Any]:
+            for (i, v) in arr.enumerated() { flatten(v, prefix: "\(prefix)[\(i)]", into: &out) }
+        default:
+            out.append((prefix, "\(value)"))
+        }
     }
 
     private func hmac(key: String, data: String) -> String {

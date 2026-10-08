@@ -1,4 +1,4 @@
-# Version is defined in Resources/Info.plist (CFBundleShortVersionString 2.3.0 / CFBundleVersion 5).
+# Version is defined in Resources/Info.plist (CFBundleShortVersionString 2.4.0 / CFBundleVersion 6).
 # MIN_OS 13.0: required for universal build on macOS 27 toolchain (x86_64 Swift compat56 shim dropped below 13.0).
 APP     = EFStatus
 BUNDLE  = $(APP).app

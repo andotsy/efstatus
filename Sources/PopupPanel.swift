@@ -129,6 +129,7 @@ class PopupPanel: NSPanel {
         progressBar.progress     = 0
         timeLabel.stringValue    = "Updating…"
         timeLabel.textColor      = NSColor.white.withAlphaComponent(0.4)
+        timeBoltView.isHidden    = true
         inWLabel.stringValue     = "— W"
         outWLabel.stringValue    = "— W"
         refreshButton.setLoading(true)

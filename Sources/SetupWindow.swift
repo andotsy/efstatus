@@ -4,14 +4,18 @@ class SetupWindow: NSWindow {
     var onSave: ((Credentials) -> Void)?
 
     private let accessKeyField = NSTextField()
-    private let secretKeyField = NSTextField()
+    private let secretKeyField = NSSecureTextField()
     private let serialField    = NSTextField()
     private let statusLabel    = NSTextField(wrappingLabelWithString: "")
     private var saveBtn: NSButton!
     private var verifyTask: Task<Void, Never>?
 
-    private let notifyLostCheck     = NSButton(checkboxWithTitle: "Notify when input power is lost (after 7 s)", target: nil, action: nil)
-    private let notifyRestoredCheck = NSButton(checkboxWithTitle: "Notify when input power is restored", target: nil, action: nil)
+    private let notifyChecks: [(NotificationPref, NSButton)] = [
+        (.inputLost,     NSButton(checkboxWithTitle: "Input power is lost", target: nil, action: nil)),
+        (.inputRestored, NSButton(checkboxWithTitle: "Input power is restored", target: nil, action: nil)),
+        (.lowBattery,    NSButton(checkboxWithTitle: "Battery drops to 20% and 10% while discharging", target: nil, action: nil)),
+        (.fullCharge,    NSButton(checkboxWithTitle: "Battery is fully charged", target: nil, action: nil)),
+    ]
 
     convenience init() {
         self.init(
@@ -29,10 +33,11 @@ class SetupWindow: NSWindow {
             secretKeyField.stringValue = c.secretKey
             serialField.stringValue    = c.serial
         }
-        notifyLostCheck.state     = UserDefaults.standard.bool(forKey: "notifyInputLost")     ? .on : .off
-        notifyRestoredCheck.state = UserDefaults.standard.bool(forKey: "notifyInputRestored") ? .on : .off
-        notifyLostCheck.target     = self; notifyLostCheck.action     = #selector(toggleNotifyLost)
-        notifyRestoredCheck.target = self; notifyRestoredCheck.action = #selector(toggleNotifyRestored)
+        for (pref, cb) in notifyChecks {
+            cb.state  = pref.isOn ? .on : .off
+            cb.target = self
+            cb.action = #selector(toggleNotify(_:))
+        }
         refreshNotifyWarning()
         makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -81,10 +86,10 @@ class SetupWindow: NSWindow {
         helpBtn.font        = .systemFont(ofSize: 11)
         helpBtn.contentTintColor = .linkColor
 
-        let notifTitle = NSTextField(labelWithString: "Notifications")
+        let notifTitle = NSTextField(labelWithString: "Notify me when…")
         notifTitle.font = .boldSystemFont(ofSize: 13)
 
-        for cb in [notifyLostCheck, notifyRestoredCheck] {
+        for (_, cb) in notifyChecks {
             cb.font = .systemFont(ofSize: 12)
         }
 
@@ -94,8 +99,8 @@ class SetupWindow: NSWindow {
             label("Secret Key"),  secretKeyField,
             label("Serial Number"), serialField,
             helpBtn, statusLabel, saveBtn,
-            notifTitle, notifyLostCheck, notifyRestoredCheck,
-        ])
+            notifTitle,
+        ] + notifyChecks.map { $0.1 })
         stack.orientation = .vertical
         stack.alignment   = .leading
         stack.spacing     = 6
@@ -106,7 +111,6 @@ class SetupWindow: NSWindow {
             f.widthAnchor.constraint(equalToConstant: 372).isActive = true
         }
         stack.setCustomSpacing(2,  after: sub)
-        stack.setCustomSpacing(12, after: saveBtn)
         stack.setCustomSpacing(16, after: saveBtn)
         stack.setCustomSpacing(4,  after: notifTitle)
 
@@ -117,6 +121,8 @@ class SetupWindow: NSWindow {
             stack.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: v.bottomAnchor),
         ])
+        v.layoutSubtreeIfNeeded()
+        setContentSize(NSSize(width: 420, height: stack.fittingSize.height))
     }
 
     @objc private func save() {
@@ -179,14 +185,10 @@ class SetupWindow: NSWindow {
         NSWorkspace.shared.open(URL(string: "https://developer.ecoflow.com")!)
     }
 
-    @objc private func toggleNotifyLost() {
-        UserDefaults.standard.set(notifyLostCheck.state == .on, forKey: "notifyInputLost")
-        explainNotifyIfNeeded(notifyLostCheck)
-    }
-
-    @objc private func toggleNotifyRestored() {
-        UserDefaults.standard.set(notifyRestoredCheck.state == .on, forKey: "notifyInputRestored")
-        explainNotifyIfNeeded(notifyRestoredCheck)
+    @objc private func toggleNotify(_ sender: NSButton) {
+        guard let pref = notifyChecks.first(where: { $0.1 === sender })?.0 else { return }
+        UserDefaults.standard.set(sender.state == .on, forKey: pref.rawValue)
+        explainNotifyIfNeeded(sender)
     }
 
     private func explainNotifyIfNeeded(_ checkbox: NSButton) {

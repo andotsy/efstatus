@@ -5,7 +5,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        Notifier.requestPermissionIfNeeded()
+        Notifier.configure()
         buildAppMenu()
         controller = StatusBarController()
     }
