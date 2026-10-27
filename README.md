@@ -1,10 +1,10 @@
-# EFStatus (v2.4.0)
+# EFStatus (v2.5.0)
 
 A lightweight macOS menu bar app that shows real-time EcoFlow Delta 2 battery status — no phone app needed, no Node.js, no cloud subscriptions. Ships as a universal binary for Intel and Apple Silicon (macOS 13+).
 
 ![EFStatus menu bar icon and popup showing battery percent, watts in and out, and time remaining](cover.jpg)
 
-> Running an older version? Compare the number above to the one in **About EFStatus** (right-click the menu bar icon), then re-download from [Gumroad](https://bereto.gumroad.com/l/efstatus) if you're behind.
+> Running an older version? From 2.5.0 on, EFStatus updates itself: right-click the menu bar icon → **Check for Updates…**. On 2.4.0 or earlier, re-download it once from [Gumroad](https://bereto.gumroad.com/l/efstatus).
 
 ## What it shows
 
@@ -72,7 +72,7 @@ make
 open EFStatus.app
 ```
 
-Build on a Mac (`swiftc` + `lipo`). Linux cannot produce a real `EFStatus.app`.
+Build on a Mac (`swiftc` + `lipo`). The first build downloads [Sparkle](https://sparkle-project.org) 2.10.0 into `vendor/` (checked against its SHA-256) for automatic updates. `make zip` packages `dist/EFStatus-<version>.zip`.
 
 The first launch opens a setup window where you enter your EcoFlow API credentials. They're stored in your macOS Keychain and never sent anywhere other than the EcoFlow API. Versions before 2.4.0 kept them in `UserDefaults`; 2.4.0 moves them to the Keychain automatically on first launch. After installing a new version, macOS may ask once whether EFStatus can read its Keychain item; choose **Always Allow**.
 
@@ -83,6 +83,8 @@ Because the app isn't notarized (no Apple Developer account needed), macOS will 
 ## Settings
 
 Right-click the menu bar icon → **Check for Updates…** / **Settings…** / **About EFStatus** / **Quit EFStatus**.
+
+Settings also has **Check for updates automatically** (on by default).
 
 ## Credentials
 
@@ -103,6 +105,12 @@ EFStatus sends a macOS notification when:
 
 Each power and battery alert can be toggled in Settings. Newer alerts replace older ones of the same kind instead of piling up in Notification Center. If you turn them on but macOS has denied notification permission (or a send fails), EFStatus tells you instead of failing silently.
 
+## Updates
+
+EFStatus checks for a new version once a day and asks before installing it, showing what's new with an **Install and Relaunch** button. You can also check any time from the right-click menu or About. Every update is signed, and the app only installs versions signed by the developer.
+
+After an update, macOS may ask once whether EFStatus can read its Keychain item; choose **Always Allow**.
+
 ## Origin
 
 Built by Roberto Pacheco because the EcoFlow Delta 2 doesn't surface consumption statistics in real time — and as his primary office backup power, he needed that data at a glance without picking up his phone.
@@ -122,6 +130,12 @@ chmod +x diag.sh
 ```
 
 ## Changelog
+
+### 2.5.0 — Automatic updates
+- EFStatus now updates itself: once a day it checks for a new version and shows what's new with an **Install and Relaunch** button
+- Check any time from the right-click menu or About (**Check for Updates…**)
+- Turn the daily check off in Settings (**Check for updates automatically**)
+- Updates are signed, so the app only installs versions that really come from me
 
 ### 2.4.0 — Real-time MQTT, smarter alerts, Keychain
 - **Real-time data now actually works:** the app was subscribed to an MQTT topic EcoFlow never publishes to, so it silently fell back to polling every 10 seconds. It now uses the correct feed and updates every couple of seconds

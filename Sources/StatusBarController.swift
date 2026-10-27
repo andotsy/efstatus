@@ -465,7 +465,7 @@ final class StatusBarController: NSObject {
             menu.addItem(i)
         }
         item("Settings…", #selector(showSetup), ",")
-        item("Check for Updates…", #selector(openUpdates))
+        item("Check for Updates…", #selector(checkForUpdates))
         item("Copy Diagnostics", #selector(copyDiagnostics))
         item("Help & Support", #selector(openRepo))
         item("About EFStatus", #selector(showAbout))
@@ -478,8 +478,8 @@ final class StatusBarController: NSObject {
 
     // MARK: – Actions
 
-    @objc private func openUpdates() {
-        NSWorkspace.shared.open(URL(string: "https://bereto.gumroad.com/l/efstatus")!)
+    @objc private func checkForUpdates() {
+        MainActor.assumeIsolated { Updater.shared.checkForUpdates() }
     }
 
     @objc private func openRepo() {

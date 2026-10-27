@@ -10,6 +10,8 @@ class SetupWindow: NSWindow {
     private var saveBtn: NSButton!
     private var verifyTask: Task<Void, Never>?
 
+    private let updatesCheck = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
+
     private let notifyChecks: [(NotificationPref, NSButton)] = [
         (.inputLost,     NSButton(checkboxWithTitle: "Input power is lost", target: nil, action: nil)),
         (.inputRestored, NSButton(checkboxWithTitle: "Input power is restored", target: nil, action: nil)),
@@ -33,6 +35,9 @@ class SetupWindow: NSWindow {
             secretKeyField.stringValue = c.secretKey
             serialField.stringValue    = c.serial
         }
+        updatesCheck.state  = MainActor.assumeIsolated { Updater.shared.automaticallyChecks } ? .on : .off
+        updatesCheck.target = self
+        updatesCheck.action = #selector(toggleUpdates)
         for (pref, cb) in notifyChecks {
             cb.state  = pref.isOn ? .on : .off
             cb.target = self
@@ -89,6 +94,10 @@ class SetupWindow: NSWindow {
         let notifTitle = NSTextField(labelWithString: "Notify me when…")
         notifTitle.font = .boldSystemFont(ofSize: 13)
 
+        let updatesTitle = NSTextField(labelWithString: "Updates")
+        updatesTitle.font = .boldSystemFont(ofSize: 13)
+        updatesCheck.font = .systemFont(ofSize: 12)
+
         for (_, cb) in notifyChecks {
             cb.font = .systemFont(ofSize: 12)
         }
@@ -100,7 +109,7 @@ class SetupWindow: NSWindow {
             label("Serial Number"), serialField,
             helpBtn, statusLabel, saveBtn,
             notifTitle,
-        ] + notifyChecks.map { $0.1 })
+        ] + notifyChecks.map { $0.1 } + [updatesTitle, updatesCheck])
         stack.orientation = .vertical
         stack.alignment   = .leading
         stack.spacing     = 6
@@ -113,6 +122,8 @@ class SetupWindow: NSWindow {
         stack.setCustomSpacing(2,  after: sub)
         stack.setCustomSpacing(16, after: saveBtn)
         stack.setCustomSpacing(4,  after: notifTitle)
+        if let last = notifyChecks.last?.1 { stack.setCustomSpacing(16, after: last) }
+        stack.setCustomSpacing(4,  after: updatesTitle)
 
         v.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -183,6 +194,11 @@ class SetupWindow: NSWindow {
 
     @objc private func openDocs() {
         NSWorkspace.shared.open(URL(string: "https://developer.ecoflow.com")!)
+    }
+
+    @objc private func toggleUpdates() {
+        let on = updatesCheck.state == .on
+        MainActor.assumeIsolated { Updater.shared.automaticallyChecks = on }
     }
 
     @objc private func toggleNotify(_ sender: NSButton) {

@@ -2,32 +2,42 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.efstatus.app</string>
-    <key>CFBundleName</key>
-    <string>EFStatus</string>
-    <key>CFBundleDisplayName</key>
-    <string>EFStatus</string>
-    <key>CFBundleVersion</key>
-    <string>6</string>
-    <key>CFBundleShortVersionString</key>
-    <string>2.4.0</string>
-    <key>CFBundleExecutable</key>
-    <string>EFStatus</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <false/>
-    </dict>
-    <key>NSHumanReadableCopyright</key>
-    <string>© 2026 Roberto Pacheco</string>
+	<key>CFBundleDisplayName</key>
+	<string>EFStatus</string>
+	<key>CFBundleExecutable</key>
+	<string>EFStatus</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.efstatus.app</string>
+	<key>CFBundleName</key>
+	<string>EFStatus</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.5.0</string>
+	<key>CFBundleVersion</key>
+	<string>7</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+	</dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Roberto Pacheco</string>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://app-updates.bereto.workers.dev/efstatus/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>qLMiFNAkLUZHgtEuRlPKjYrhDXNpuxs4fKY6NtSB3RE=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>
