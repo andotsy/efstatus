@@ -367,7 +367,7 @@ final class StatusBarController: NSObject {
 
         // ~60s time-based average of net watts for time estimates (MQTT can deliver
         // several readings a second); snap when the direction flips (plug/unplug).
-        let raw = st.inW - st.outW
+        let raw = st.batteryW ?? (st.inW - st.outW)
         let now = Date()
         if let s = smoothedNet, let at = smoothedAt, (s > 0) == (raw > 0) {
             let alpha = 1 - exp(-now.timeIntervalSince(at) / 60)
